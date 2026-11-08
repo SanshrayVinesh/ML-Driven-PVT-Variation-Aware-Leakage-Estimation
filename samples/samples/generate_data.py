@@ -10,25 +10,21 @@ import re
 
 
 
-# Set fixed random seed for reproducibility
-
 np.random.seed(42)
 
 
 
-# --- CONFIGURATION (Adjust to your assignment) ---
+# --- CONFIGURATION ---
 
-MODEL_FILE = "32nm_HP.pm"  # e.g., 16nm_HP.pm, 45nm_HP.pm, etc.
+MODEL_FILE = "32nm_HP.pm"  # Ensure this file is in the current directory
 
-L_MIN = 16e-9              # Channel length (16nm, 22nm, 32nm, 45nm)
+L_MIN = 16e-9              # Feature size base multiplier for Width sweep
 
-VDD_NOMINAL = 0.9          # 0.9V or 1.0V
+VDD_NOMINAL = 0.9          # Nominal VDD (0.9V or 1.0V)
 
 NUM_SAMPLES = 10000
 
 
-
-# Base nominal process parameters (replace with values from your model file)
 
 NOMINAL_PARAMS = {
 
@@ -56,8 +52,6 @@ def draw_pvt_samples(n_samples):
 
 
 
-    # Process variation (+/- 10% uniform draw for NMOS & PMOS separately)
-
     proc_data = {}
 
     for param in ['vth0', 'toxe', 'ndep', 'u0', 'xj']:
@@ -68,21 +62,13 @@ def draw_pvt_samples(n_samples):
 
 
 
-    df = pd.DataFrame({
-
-        'vdd': vdd, 'temp': temp, 'w': w, 'vd': vd, 'vs': vs,
-
-        **proc_data
-
-    })
-
-    return df
+    return pd.DataFrame({'vdd': vdd, 'temp': temp, 'w': w, 'vd': vd, 'vs': vs, **proc_data})
 
 
 
 def generate_netlist(case, row):
 
-    """Creates a single-transistor SPICE netlist with strict tolerance options."""
+    """Generates SPICE netlist using nominal model length to guarantee Leff > 0."""
 
     is_nmos = "NMOS" in case
 
@@ -98,19 +84,17 @@ def generate_netlist(case, row):
 
 
 
+    # NOTE: L is omitted so NGspice defaults to the model file's calibrated length
+
     netlist = f"""* Single Transistor PVT Test - {case}
 
 .include "{MODEL_FILE}"
 
 
 
-* Options strictly as required by specification
-
-.options gmin=1e-18 abstol=1e-18 reltol=1e-6 vntol=1e-9
+.options gmin=1e-18 abstol=1e-18 reltol=1e-6 vntol=1e-9 temp={row['temp']}
 
 
-
-* Independent Voltage Sources for all terminals
 
 Vd d 0 DC {row['vd']}
 
@@ -122,15 +106,13 @@ Vb b 0 DC {vb}
 
 
 
-* Device Under Test
-
-M1 d g s b {fet_type} W={row['w']} L={L_MIN} TEMP={row['temp']}
+M1 d g s b {fet_type} W={row['w']}
 
 
 
 .control
 
-dc Vd {row['vd']} {row['vd']} 1
+op
 
 print i(Vd) i(Vg) i(Vs) i(Vb)
 
@@ -146,51 +128,65 @@ print i(Vd) i(Vg) i(Vs) i(Vb)
 
 def run_ngspice_batch(case, df_samples):
 
-    """Executes NGspice simulations and extracts terminal currents."""
-
     results = []
 
-    print(f"Simulating {case} ({len(df_samples)} samples)...")
+    print(f"\n==================== Simulating {case} ({len(df_samples)} samples) ====================")
 
-    
+
 
     for idx, row in df_samples.iterrows():
 
         netlist_str, vg, vb = generate_netlist(case, row)
 
-        with open("temp.cir", "w") as f:
+        
 
-            f.write(netlist_str)
+        proc = subprocess.run(
+
+            ["ngspice", "-b"],
+
+            input=netlist_str,
+
+            stdout=subprocess.PIPE,
+
+            stderr=subprocess.PIPE,
+
+            text=True
+
+        )
 
 
 
-        # Run NGspice in batch mode
+        output = proc.stdout
 
-        cmd = ["ngspice", "-b", "temp.cir"]
-
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        current_matches = re.findall(r"=\s*([-\+]?\d+(?:\.\d+)?[eE][-\+]?\d+)", output)
 
         
 
-        # Parse output currents (Id, Ig, Is, Ib)
+        if idx < 3:
 
-        # Note: SPICE current entering the node is positive, leaving is negative
+            print(f"\n--- DEBUG SAMPLE #{idx + 1} ({case}) ---")
 
-        try:
+            print(f"[PARSED MATCHES]: {current_matches}")
 
-            matches = re.findall(r"i\(v\w+\)\s*=\s*([-\d\.eE\+]+)", proc.stdout)
+            print("-" * 50)
 
-            if len(matches) >= 4:
 
-                id_, ig, is_, ib = map(float, matches[:4])
+
+        if len(current_matches) >= 4:
+
+            id_, ig, is_, ib = map(float, current_matches[:4])
+
+        else:
+
+            all_numbers = re.findall(r"[-+]?\d+\.\d+e[-+]?\d+", output)
+
+            if len(all_numbers) >= 4:
+
+                id_, ig, is_, ib = map(float, all_numbers[-4:])
 
             else:
 
                 id_, ig, is_, ib = np.nan, np.nan, np.nan, np.nan
-
-        except Exception:
-
-            id_, ig, is_, ib = np.nan, np.nan, np.nan, np.nan
 
 
 
@@ -220,6 +216,12 @@ def run_ngspice_batch(case, df_samples):
 
 
 
+        if (idx + 1) % 2000 == 0:
+
+            print(f"  Processed {idx + 1}/{len(df_samples)} samples...")
+
+
+
     out_df = pd.DataFrame(results)
 
     out_df.to_csv(f"{case}.csv", index=False)
@@ -228,15 +230,11 @@ def run_ngspice_batch(case, df_samples):
 
 
 
-# --- EXECUTION ---
-
 if __name__ == "__main__":
 
     cases = ["NMOS_ON", "NMOS_OFF", "PMOS_ON", "PMOS_OFF"]
 
     samples_df = draw_pvt_samples(NUM_SAMPLES)
-
-    
 
     for case in cases:
 
